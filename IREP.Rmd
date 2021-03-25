@@ -1,0 +1,351 @@
+---
+title: "Géocodage de la table des émissions du Registre des émissions polluantes"
+author: Cedric Rossi
+date: March, 2013
+output: html_notebook
+editor_options:
+  chunk_output_type: console
+---
+```{r imports}
+library(tidyverse)
+library(banR)
+```
+
+```{r get_the_data}
+options(timeout = 600)
+data_dir <- 'data'
+
+if (!dir.exists(data_dir)) {
+  dir.create(data_dir)
+}
+# Base IREP
+# https://www.georisques.gouv.fr/donnees/bases-de-donnees/installations-industrielles-rejetant-des-polluants
+irep_url <- "https://files.georisques.fr/irep/2019.zip"
+irep_destfile <-  str_c(data_dir, "/irep_2019.zip")
+if (!file.exists(irep_destfile)) {
+  download.file(irep_url, irep_destfile)
+  irep_emissions_csv <- unz(irep_destfile, "emissions.csv")
+  irep_establishments_csv <-
+    unz(irep_destfile, "etablissements.csv")
+}
+
+# Base SIRENE
+# https://www.data.gouv.fr/fr/datasets/base-sirene-des-entreprises-et-de-leurs-etablissements-siren-siret/
+sirene_url = "https://www.data.gouv.fr/fr/datasets/r/3966c990-d3a0-48b4-95b9-745fa24b2589"
+sirene_destfile <-  str_c(data_dir, "/etablissements-sirene.zip")
+if (!file.exists(sirene_destfile)) {
+  download.file(sirene_url, sirene_destfile)
+  # The unzipped CSV file is more than 4GB, so R's unzip will choke on it
+  # We've got to unzip it manually
+  unzip(sirene_destfile, unzip = getOption("unzip"), exdir=data_dir)
+  sirene_csv <- str_c(data_dir, '/', unzip(sirene_destfile, list = TRUE)[[1]])
+}
+
+# Base des codes postaux
+# https://www.data.gouv.fr/fr/datasets/base-officielle-des-codes-postaux/
+postcodes_url <-
+  "https://www.data.gouv.fr/fr/datasets/r/554590ab-ae62-40ac-8353-ee75162c05ee"
+postcodes_destfile <- str_c(data_dir, "/code_postaux.csv")
+if (!file.exists(postcodes_destfile)) {
+  download.file(postcodes_url, postcodes_destfile)
+}
+```
+
+```{r load_data}
+emissions <- read_csv(irep_emissions_csv,
+                      col_types = 'ccfffdf')
+
+# We are only interested in establishments emitting pollutants
+establishments <- read_csv(irep_establishments_csv,
+                           col_types = "ccccccffddcccc") %>%
+  semi_join(emissions, by = "Identifiant")
+
+
+# ...And only in SIRENE entries associated with these establishments
+base_sirene <- read_csv(
+  sirene_csv,
+  col_types = cols_only(
+    siret = col_character(),
+    numeroVoieEtablissement = col_character(),
+    indiceRepetitionEtablissement = col_character(),
+    typeVoieEtablissement = col_character(),
+    libelleVoieEtablissement = col_character(),
+    codePostalEtablissement = col_character(),
+    codeCedexEtablissement = col_character()
+  )
+) %>%
+  semi_join(establishments, by = c("siret" = "Numero_SIRET")) %>%
+  unite(
+    sirene_adresse,
+    numeroVoieEtablissement,
+    indiceRepetitionEtablissement,
+    typeVoieEtablissement,
+    libelleVoieEtablissement,
+    remove = TRUE,
+    na.rm = TRUE,
+    sep = ' '
+  ) %>%
+  rename(sirene_code_postal=codePostalEtablissement)
+
+# Create a CEDEX -> postal code table from the SIRENE base
+base_cedex <- base_sirene %>% filter(!is.na(codeCedexEtablissement) & !is.na(sirene_code_postal)) %>%
+  select(codeCedexEtablissement, sirene_code_postal) %>%
+  distinct(codeCedexEtablissement, .keep_all = TRUE) %>%
+  rename(cedex_cp=sirene_code_postal,
+         cedex_cedex=codeCedexEtablissement)
+
+base_sirene <- base_sirene %>% select(-codeCedexEtablissement)
+
+base_postalcode <-  read_delim(postcodes_destfile,
+                             delim=";",
+                            col_types = "cccccc") %>%
+  rename_with(tolower) %>%
+  select(code_postal, nom_commune, coordonnees_gps) %>%
+  distinct(code_postal, nom_commune, .keep_all = TRUE) %>%
+  separate(coordonnees_gps,
+           into = c("latitude", "longitude"),
+           sep = ",")
+```
+
+
+```{r add_siren_info}
+
+establishments_sirene <- establishments %>%
+  left_join(base_sirene, by = c("Numero_SIRET" = "siret")) %>%
+  left_join(base_cedex, by = c("Code_Postal" = "cedex_cedex")) %>%
+  # The `code_postal_commune` column will contain real postcodes, not cedexes
+  mutate(code_postal_commune = ifelse(is.na(cedex_cp), Code_Postal, cedex_cp),
+         cedex_cp = NULL)
+
+```
+
+```{r geocode_establishments}
+# The geographic information of the IREP base is not easily usable, as the
+# projection varies row by row, is not documented, and frequently incorrect.
+# So let's geocode the establishments using the BAN API
+establishments_ban <- establishments_sirene  %>%
+  geocode_tbl(adresse = Adresse, code_postal = code_postal_commune)
+
+establishments_ban_ok <- establishments_ban %>%
+  filter(!is.na(result_score)) %>%
+  mutate(geocode_src = "API BAN",
+         geocode_qualite = result_score) %>%
+  select(-starts_with("result_"))
+
+# We'll accumulate all properly geocoded establishments in `establishment_geo`
+establishment_geo <- establishments_ban_ok
+
+establishments_ban_nok <- establishments_ban %>%
+  filter(is.na(result_score)) %>%
+  select(-latitude, -longitude, -starts_with("result_"))
+
+# First fix:
+# The establishments addresses are frequently imprecise so let's try the SIRENE
+# address instead. It doesn't always correspond to the same physical place,
+# but when it does, it's often of a better quality.
+# We'll only consider this fix if the two addresses are in the same postcode:
+# at worst, the error will be limited.
+establishment_no_sirene_address <- establishments_ban_nok %>%
+  filter(is.na(sirene_adresse) | sirene_adresse == "" | sirene_code_postal != code_postal_commune)
+
+establishment_sirene_address <- establishments_ban_nok %>%
+  filter(!is.na(sirene_adresse) & sirene_adresse != "" & sirene_code_postal == code_postal_commune) %>%
+  geocode_tbl(adresse = sirene_adresse, code_postal = code_postal_commune)
+
+establishment_sirene_address_ok <- establishment_sirene_address %>%
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  mutate(geocode_src = "API BAN - Adresse SIRENE",
+         geocode_qualite = 'commune') %>%
+  select(-starts_with("result_"))
+
+establishment_geo <- establishment_geo %>%
+  rbind(establishment_sirene_address_ok)
+
+establishment_sirene_address_nok <- establishment_sirene_address %>%
+  filter(is.na(latitude) | is.na(longitude)) %>%
+  select(-latitude, -longitude, -starts_with("result_")) %>%
+  rbind(establishment_no_sirene_address)
+
+
+# Second fix: for the establishments we couldn't locate, get the city location
+# from the postal codes table
+establishment_cp <- establishment_sirene_address_nok %>%
+  mutate(commune_norm = toupper(str_replace(str_replace_all(.$Commune, '-', ' '), '^SAINT ', 'ST '))) %>%
+  left_join(base_postalcode, by = c("code_postal_commune" = "code_postal", "commune_norm" = "nom_commune"))
+
+establishment_cp_ok <- establishment_cp %>%
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  mutate(geocode_src = "Base Code Postaux",
+         geocode_qualite = 'commune') %>%
+    select(-commune_norm)
+
+establishment_geo <- establishment_geo %>%
+  rbind(establishment_cp_ok)
+
+establishment_cp_nok <- establishment_cp %>%
+  filter(is.na(latitude) | is.na(longitude)) %>%
+  select(-latitude, -longitude)
+
+## Third fix: try a less stringent match on the postal codes table
+establishment_cp2 <- establishment_cp_nok %>%
+  left_join(base_postalcode, by = c("code_postal_commune" = "code_postal"), suffix = c("", ".2")) %>%
+  distinct(Identifiant, .keep_all = TRUE) %>%
+  select(-nom_commune)
+
+establishment_cp2_ok <- establishment_cp2 %>%
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  mutate(geocode_src = "Base Code Postaux",
+         geocode_qualite = 'code postal') %>%
+  select(-commune_norm)
+
+establishment_geo <- establishment_geo %>%
+  rbind(establishment_cp2_ok)
+
+establishment_cp2_ok_nok <- establishment_cp2 %>%
+  filter(is.na(latitude) | is.na(longitude)) %>%
+  select(-latitude, -longitude)
+
+
+## Fourth fix: replace the last number of the postal code by a 0
+establishment_cp_0 <- establishment_cp2_ok_nok %>%
+  mutate(code_postal_commune = str_c(substr(code_postal_commune, 1, 4), '0')) %>%
+  left_join(base_postalcode, by = c("code_postal_commune" = "code_postal"), suffix = c("", ".2")) %>%
+  distinct(Identifiant, .keep_all = TRUE) %>%
+  select(-nom_commune)
+
+establishment_cp_0_ok <- establishment_cp_0 %>%
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  mutate(geocode_src = "Base Code Postaux",
+         geocode_qualite = 'code postal approché') %>%
+  select(-commune_norm)
+
+establishment_geo <- establishment_geo %>%
+  rbind(establishment_cp_0_ok)
+
+establishment_cp_0_nok <- establishment_cp_0 %>%
+  filter(is.na(latitude) | is.na(longitude)) %>%
+  select(-latitude, -longitude)
+
+
+## Fifth fix: we didn't find the postcode, so try dept + city name
+# Add a 'code_dept' field to the postal codes table and to the remaining
+# establishments. This is not a real departement code (Corsica would be incorrect)
+# but it's enough for joining
+base_postalcode_w_dept <- base_postalcode %>%
+  mutate(code_dept = case_when(
+    substr(code_postal, 1, 2) == '97' ~ substr(code_postal,  1, 3),
+    # Doesn't work for Corsica, which will get 20 instead of 2A or 2B
+    # but it's enough for matching with the establishments table
+    TRUE ~ substr(code_postal, 1, 2)
+  ))
+
+establishment_cp_0_nok_w_dept <- establishment_cp_0_nok %>%
+  mutate(
+         # Extract the dept from the postal code, to workaround some errors on
+         # the `Departement` column
+         # Doesn't work for Corsica, which will get 20 instead of 2A or 2B
+         # but it's enough for matching with the postal code base.
+         code_dept = case_when(
+           substr(code_postal_commune, 1, 2) == '97' ~ substr(code_postal_commune,  1, 3),
+           TRUE ~ substr(code_postal_commune, 1, 2)
+           )
+         )
+
+establishment_dept <- establishment_cp_0_nok_w_dept %>%
+  left_join(base_postalcode_w_dept, by = c("code_dept" = "code_dept", "commune_norm" = "nom_commune"),
+            suffix = c("", ".2")) %>%
+  distinct(Identifiant, .keep_all = TRUE) %>%
+  select(-code_postal, -code_dept)
+
+establishment_dept_ok <- establishment_dept %>%
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  mutate(geocode_src = "Base Code Postaux",
+         geocode_qualite = 'commune probable') %>%
+    select(-commune_norm)
+
+establishment_geo <- establishment_geo %>%
+  rbind(establishment_dept_ok)
+
+establishment_dept_nok <- establishment_dept %>%
+  filter(is.na(latitude) | is.na(longitude)) %>%
+  select(-latitude, -longitude)
+
+
+## Last resort, fix manually
+
+d <- establishment_dept_nok
+d[d$Identifiant == "051.00692", 'code_postal'] = "51100"
+d[d$Identifiant == "063.01580", 'code_postal'] = "49420"
+d[d$Identifiant == "065.06453", 'code_postal'] = "93400"
+
+establishment_manual <- d %>%
+  left_join(base_postalcode, by = c("code_postal"),
+            suffix = c("", ".2")) %>%
+  distinct(Identifiant, .keep_all = TRUE) %>%
+  select(-nom_commune, -code_postal) %>%
+  mutate(geocode_src = "Base Code Postaux",
+         geocode_qualite = 'code postal corrigé') %>%
+  select(-commune_norm)
+
+
+establishment_geo <- establishment_geo %>%
+  rbind(establishment_manual) %>%
+  select(-code_postal_commune)
+
+```
+
+```{r fix_emissions}
+
+# Add the establishments infos to the emissions table
+emissions_geo <-  emissions %>%
+  left_join(establishment_geo, by = "Identifiant", suffix = c("", ".2")) %>%
+  select(-Nom_Etablissement.2)
+
+# Some emissions identifiants don't have a entry in the establishment table
+# so hardcode a postcode
+emissions_geo_ok <- emissions_geo %>% filter(!is.na(Numero_SIRET))
+emissions_geo_nok  <- emissions_geo %>% filter(is.na(Numero_SIRET)) %>%
+    select(-latitude, -longitude)
+d <- emissions_geo_nok
+d[d$Identifiant == "061.04157", 'Code_Postal'] = "69001"
+d[d$Identifiant == "061.04159", 'Code_Postal'] = "69003"
+d[d$Identifiant == "061.04169", 'Code_Postal'] = "69001"
+d[d$Identifiant == "061.04223", 'Code_Postal'] = "69001"
+d[d$Identifiant == "061.04242", 'Code_Postal'] = "69007"
+d[d$Identifiant == "061.04259", 'Code_Postal'] = "69008"
+d[d$Identifiant == "061.13980", 'Code_Postal'] = "69001"
+d[d$Identifiant == "064.00635", 'Code_Postal'] = "13013"
+d[d$Identifiant == "064.00651", 'Code_Postal'] = "13013"
+d[d$Identifiant == "064.02259", 'Code_Postal'] = "13014"
+d[d$Identifiant == "064.02472", 'Code_Postal'] = "13016"
+d[d$Identifiant == "064.03649", 'Code_Postal'] = "13016"
+d[d$Identifiant == "068.04665", 'Code_Postal'] = "31800"
+d[d$Identifiant == "221.00014", 'Code_Postal'] = "97110"
+d[d$Identifiant == "221.00015", 'Code_Postal'] = "97110"
+d[d$Identifiant == "400.00290", 'Code_Postal'] = "97500"
+d[d$Identifiant == "713.05501", 'Code_Postal'] = "13014"
+
+emissions_manual <- d %>%
+  left_join(base_postalcode, by = c("Code_Postal" = "code_postal")) %>%
+  distinct(Identifiant, Annee_Emission, Milieu, Polluant, .keep_all = TRUE) %>%
+  select(-nom_commune) %>%
+  mutate(geocode_src = "Base Code Postaux",
+         geocode_qualite = 'code postal corrigé')
+
+# 97500 has not lat/long in the postal codes table
+emissions_manual[emissions_manual$Identifiant == "400.00290", 'latitude'] = "47.105605"
+emissions_manual[emissions_manual$Identifiant == "400.00290", 'longitude'] = "-56.385647"
+```
+
+## Now that we've got at least an approximate location for all emissions,
+## we could verify the original Coordonnees_X, Coordonnees_Y (which are
+## potentially more precise) and use them when they look correct.
+
+
+```{r}
+clean_result <- emissions_geo_ok %>%
+  rbind(emissions_manual) %>%
+  arrange(desc(quantite))
+
+write_csv(clean_result, "emissions_geo.csv")
+```
