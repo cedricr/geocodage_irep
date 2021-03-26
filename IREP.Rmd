@@ -24,10 +24,10 @@ irep_url <- "https://files.georisques.fr/irep/2019.zip"
 irep_destfile <-  str_c(data_dir, "/irep_2019.zip")
 if (!file.exists(irep_destfile)) {
   download.file(irep_url, irep_destfile)
-  irep_emissions_csv <- unz(irep_destfile, "emissions.csv")
-  irep_establishments_csv <-
-    unz(irep_destfile, "etablissements.csv")
 }
+irep_emissions_csv <- unz(irep_destfile, "emissions.csv")
+irep_establishments_csv <-
+  unz(irep_destfile, "etablissements.csv")
 
 # Base SIRENE
 # https://www.data.gouv.fr/fr/datasets/base-sirene-des-entreprises-et-de-leurs-etablissements-siren-siret/
@@ -37,9 +37,12 @@ if (!file.exists(sirene_destfile)) {
   download.file(sirene_url, sirene_destfile)
   # The unzipped CSV file is more than 4GB, so R's unzip will choke on it
   # We've got to unzip it manually
-  unzip(sirene_destfile, unzip = getOption("unzip"), exdir=data_dir)
-  sirene_csv <- str_c(data_dir, '/', unzip(sirene_destfile, list = TRUE)[[1]])
+  unzip(sirene_destfile,
+        unzip = getOption("unzip"),
+        exdir = data_dir)
 }
+sirene_csv <-
+  str_c(data_dir, '/', unzip(sirene_destfile, list = TRUE)[[1]])
 
 # Base des codes postaux
 # https://www.data.gouv.fr/fr/datasets/base-officielle-des-codes-postaux/
