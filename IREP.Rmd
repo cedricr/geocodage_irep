@@ -64,7 +64,6 @@ establishments <- read_csv(irep_establishments_csv,
   semi_join(emissions, by = "Identifiant")
 
 
-# ...And only in SIRENE entries associated with these establishments
 base_sirene <- read_csv(
   sirene_csv,
   col_types = cols_only(
@@ -77,6 +76,16 @@ base_sirene <- read_csv(
     codeCedexEtablissement = col_character()
   )
 ) %>%
+  rename(sirene_code_postal=codePostalEtablissement)
+
+# Create a CEDEX -> postal code table from the SIRENE base
+base_cedex <- base_sirene %>% filter(!is.na(codeCedexEtablissement) & !is.na(sirene_code_postal)) %>%
+  select(codeCedexEtablissement, sirene_code_postal) %>%
+  distinct(codeCedexEtablissement, .keep_all = TRUE) %>%
+  rename(cedex_cp=sirene_code_postal,
+         cedex_cedex=codeCedexEtablissement)
+
+base_sirene_utile <- base_sirene %>%
   semi_join(establishments, by = c("siret" = "Numero_SIRET")) %>%
   unite(
     sirene_adresse,
@@ -88,16 +97,8 @@ base_sirene <- read_csv(
     na.rm = TRUE,
     sep = ' '
   ) %>%
-  rename(sirene_code_postal=codePostalEtablissement)
+  select(-codeCedexEtablissement)
 
-# Create a CEDEX -> postal code table from the SIRENE base
-base_cedex <- base_sirene %>% filter(!is.na(codeCedexEtablissement) & !is.na(sirene_code_postal)) %>%
-  select(codeCedexEtablissement, sirene_code_postal) %>%
-  distinct(codeCedexEtablissement, .keep_all = TRUE) %>%
-  rename(cedex_cp=sirene_code_postal,
-         cedex_cedex=codeCedexEtablissement)
-
-base_sirene <- base_sirene %>% select(-codeCedexEtablissement)
 
 base_postalcode <-  read_delim(postcodes_destfile,
                              delim=";",
@@ -114,7 +115,7 @@ base_postalcode <-  read_delim(postcodes_destfile,
 ```{r add_siren_info}
 
 establishments_sirene <- establishments %>%
-  left_join(base_sirene, by = c("Numero_SIRET" = "siret")) %>%
+  left_join(base_sirene_utile, by = c("Numero_SIRET" = "siret")) %>%
   left_join(base_cedex, by = c("Code_Postal" = "cedex_cedex")) %>%
   # The `code_postal_commune` column will contain real postcodes, not cedexes
   mutate(code_postal_commune = ifelse(is.na(cedex_cp), Code_Postal, cedex_cp),
@@ -277,9 +278,7 @@ establishment_dept_nok <- establishment_dept %>%
 ## Last resort, fix manually
 
 d <- establishment_dept_nok
-d[d$Identifiant == "051.00692", 'code_postal'] = "51100"
 d[d$Identifiant == "063.01580", 'code_postal'] = "49420"
-d[d$Identifiant == "065.06453", 'code_postal'] = "93400"
 
 establishment_manual <- d %>%
   left_join(base_postalcode, by = c("code_postal"),
@@ -348,6 +347,7 @@ emissions_manual[emissions_manual$Identifiant == "400.00290", 'longitude'] = "-5
 ```{r}
 clean_result <- emissions_geo_ok %>%
   rbind(emissions_manual) %>%
+  select(-sirene_adresse, -sirene_code_postal) %>%
   arrange(desc(quantite))
 
 write_csv(clean_result, "emissions_geo.csv")
