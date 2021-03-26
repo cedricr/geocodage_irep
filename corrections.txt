@@ -1,0 +1,1 @@
+Contacté par Amcor Selestat (067.00537) le 24/03/21, qui m’informe que la valeur d’emissions de CO2 de leur site contenue dans la base IREP est incorrecte: il faut lire 2341 tonnes/an et non pas 2,45 Mtonnes/an. Ils ont fait le nécessaire pour modifier les données à la source.
