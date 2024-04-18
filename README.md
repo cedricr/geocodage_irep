@@ -1,3 +1,5 @@
+Dépôt déplacé vers https://codeberg.org/cedricr/geocodage_irep
+
 # Géocodage de la table des émissions du Registre des émissions polluantes
 
 Le registre national des Émissions Polluantes est une base de donnée maintenue par
